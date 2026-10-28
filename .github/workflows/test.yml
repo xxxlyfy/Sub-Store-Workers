@@ -55,6 +55,9 @@ jobs:
       - name: Run Sub-Store transform tests
         run: pnpm run test:transform
 
+      - name: Build and verify Workers bundle
+        run: pnpm run build:workers
+
       - name: Start dev server
         run: |
           pnpm run dev:workers > workers-dev.log 2>&1 &
