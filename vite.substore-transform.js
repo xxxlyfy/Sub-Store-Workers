@@ -63,6 +63,43 @@ export function subStoreTransformPlugin() {
         );
     }
 
+    // 只依赖声明本身，不依赖 isSurge 判断式的具体组成。
+    // 上游会不断给该判断式增加环境项（例如 2.44.x 新增 !isEgern），
+    // 固定匹配旧表达式会让整个 Workers 构建在升级源码后直接失败。
+    function patchOpenApiEnvDetection(contents, id, pluginContext) {
+        const isNodePattern =
+            /const\s+isNode\s*=\s*eval\s*\(\s*`typeof\s+process\s*!==\s*["']undefined["']`\s*\)\s*;/;
+        if (!isNodePattern.test(contents)) {
+            pluginContext.error(
+                `[sub-store-transform] ${id} 环境检测补丁未应用：未找到 open-api.js 的 isNode eval 声明`,
+            );
+        }
+        contents = contents.replace(isNodePattern, 'const isNode = false;');
+
+        // 当前上游为单行声明：const isSurge = ...;
+        // 若未来改成多行，宁可显式报错，也不要静默跳过（Workers 依赖该分支）。
+        const isSurgePattern = /const\s+isSurge\s*=\s*[^;\n]*;/;
+        if (!isSurgePattern.test(contents)) {
+            pluginContext.error(
+                `[sub-store-transform] ${id} 环境检测补丁未应用：未找到 open-api.js 的单行 isSurge 声明`,
+            );
+        }
+        contents = contents.replace(isSurgePattern, 'const isSurge = true;');
+
+        if (!contents.includes('const isNode = false;')) {
+            pluginContext.error(
+                `[sub-store-transform] ${id} 环境检测补丁未生效：isNode 未被固定为 false`,
+            );
+        }
+        if (!contents.includes('const isSurge = true;')) {
+            pluginContext.error(
+                `[sub-store-transform] ${id} 环境检测补丁未生效：isSurge 未被固定为 true`,
+            );
+        }
+
+        return contents;
+    }
+
     function assertNoDangerousRequireResidue(contents, id, pluginContext) {
         const matched = dangerousRequirePatterns.find((pattern) => pattern.test(contents));
         if (matched) {
@@ -70,10 +107,42 @@ export function subStoreTransformPlugin() {
         }
     }
 
+    // Sub-Store 2.44.x 把 Node 内置模块访问集中到 src/runtime/*.js，
+    // 并使用裸 require()（不再包在 eval 里，以便打包器静态分析）。
+    // Workers 中 ENV().isNode 恒为 false，这些 loader 不会被调用；
+    // 但裸 require 仍会进入 Rollup 构建图并触发危险调用检查，因此需要显式替换。
+    const runtimeRequireReplacements = {
+        fs: 'globalThis.__fs_shim__',
+        path: 'globalThis.__path_shim__',
+        'stream/promises': 'globalThis.__stream_promises_shim__',
+        child_process: 'undefined',
+        dgram: 'undefined',
+        net: 'undefined',
+        tls: 'undefined',
+        'node:worker_threads': 'undefined',
+    };
+
+    function replaceRuntimeRequires(contents, id) {
+        if (!id.includes('sub-store/backend/src/runtime/')) return contents;
+        for (const [moduleName, replacement] of Object.entries(runtimeRequireReplacements)) {
+            const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\//g, '\\/');
+            contents = contents.replace(
+                new RegExp(`(?<!['\"\`])\\brequire\\s*\\(\\s*['\"\`]${escaped}['\"\`]\\s*\\)`, 'g'),
+                replacement,
+            );
+        }
+        return contents;
+    }
+
     function precompilePeggyParser(contents, id, pluginContext) {
         const match = /const\s+grammars\s*=\s*String\.raw`([\s\S]*?)`;/.exec(contents);
         if (!match) {
-            pluginContext.error(`[sub-store-transform] ${id} Peggy parser 预编译失败：未找到 grammars`);
+            // 2.44.x 起 trojan-uri.js 改成手写解析器，目录里不再全是 Peggy 语法文件。
+            // 只有仍然调用 peggy.generate() 的模块才需要预编译。
+            if (contents.includes('peggy.generate')) {
+                pluginContext.error(`[sub-store-transform] ${id} Peggy parser 预编译失败：未找到 grammars`);
+            }
+            return contents;
         }
 
         const parserSource = peggy.generate(match[1], {
@@ -81,17 +150,25 @@ export function subStoreTransformPlugin() {
             format: 'bare',
         });
 
-        const output = `// __SUB_STORE_WORKERS_PATCH__PEGGY_PRECOMPILED_PARSER__
-const parser = ${parserSource};
+        // 仅替换 peggy.generate(grammars) 调用，保留文件内的辅助函数、
+        // qx 的 alpn 包装逻辑以及 getParser 缓存逻辑。
+        const generatePattern = /peggy\.generate\s*\(\s*grammars\s*\)/g;
+        if (!generatePattern.test(contents)) {
+            pluginContext.error(
+                `[sub-store-transform] ${id} Peggy parser 预编译失败：未找到 peggy.generate(grammars)`,
+            );
+        }
+        generatePattern.lastIndex = 0;
+        contents = contents.replace(generatePattern, `(${parserSource})`);
+        contents = contents.replace(/import\s+peggy\s+from\s+['"]peggy['"];?\s*\n?/, '');
 
-export default function getParser() {
-    return parser;
-}
-`;
-        if (output.includes('peggy.generate')) {
+        if (contents.includes('peggy.generate')) {
             pluginContext.error(`[sub-store-transform] ${id} Peggy parser 预编译失败：仍包含 peggy.generate`);
         }
-        return output;
+        if (/from\s+['"]peggy['"]/.test(contents)) {
+            pluginContext.error(`[sub-store-transform] ${id} Peggy parser 预编译失败：仍导入 peggy`);
+        }
+        return contents;
     }
 
     return {
@@ -122,8 +199,7 @@ export default function getParser() {
             contents = replaceEvalRequire(contents, '@maxmind/geoip2-node', '({ Reader: { openBuffer: () => ({ country: () => null, asn: () => null }) } })');
             contents = replaceEvalRequire(contents, 'stream/promises', 'globalThis.__stream_promises_shim__');
 
-            contents = contents.replace(/const\s+isNode\s*=\s*eval\s*\(\s*`typeof\s+process\s*!==\s*"undefined"`\s*\)/g, 'const isNode = false');
-            contents = contents.replace(/const\s+isSurge\s*=\s*typeof\s+\$httpClient\s*!==\s*['"]undefined['"]\s*&&\s*!isLoon\s*;/g, 'const isSurge = true;');
+            contents = replaceRuntimeRequires(contents, id);
 
             assertNoDangerousRequireResidue(contents, id, this);
 
@@ -189,17 +265,16 @@ function __emitDone__(requestId, response) {
                         'function Response(corsHeaders = {}, requestId) {',
                     );
                     contents = contents.replace(
-                        '$done(response);',
+                        /\$done\(\s*response\s*\);/g,
                         '__emitDone__(requestId, response);',
                     );
                     contents = contents.replace(
-                        `$done({
-                        response,
-                    });`,
-                        `__emitDone__(requestId, {
-                        response,
-                    });`,
+                        /\$done\(\s*\{\s*response\s*,?\s*\}\s*\);/g,
+                        '__emitDone__(requestId, { response });',
                     );
+                    if (contents.includes('$done(')) {
+                        this.error('[sub-store-transform] express.js 补丁自检失败：仍有 $done() 未绑定 requestId');
+                    }
                 }
                 contents = contents.replace(
                     /app\.start\s*=\s*\(\)\s*=>\s*\{\s*dispatch\s*\(\s*\$request\s*\)\s*;\s*\}/g,
@@ -234,14 +309,7 @@ function __emitDone__(requestId, response) {
                 openApiFileSeen = true;
                 const beforeOpenApi = contents;
 
-                const needsIsNodePatch = beforeOpenApi.includes('const isNode = eval(`typeof process');
-                if (needsIsNodePatch && !contents.includes('const isNode = false')) {
-                    this.error('[sub-store-transform] open-api.js 环境检测补丁未生效：isNode 仍可能触发 eval()');
-                }
-                const needsIsSurgePatch = beforeOpenApi.includes('const isSurge = typeof $httpClient');
-                if (needsIsSurgePatch && !contents.includes('const isSurge = true;')) {
-                    this.error('[sub-store-transform] open-api.js 环境检测补丁未生效：isSurge 未被固定为 true');
-                }
+                contents = patchOpenApiEnvDetection(contents, id, this);
 
                 if (contents.includes('export class OpenAPI')) {
                     contents = contents.replace(
